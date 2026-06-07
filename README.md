@@ -1,8 +1,11 @@
 # Bayesian Precision–Recall
 
+[![PyPI](https://img.shields.io/pypi/v/bayesian-precision-recall)](https://pypi.org/project/bayesian-precision-recall/)
+
 Precision and recall are point estimates on a finite test set — they carry uncertainty.
 This library models that uncertainty using **Beta-Binomial conjugate models**, giving you full
-posterior distributions for precision, recall, and F1 rather than single numbers.
+posterior distributions for precision, recall, and F1 rather than single numbers, based on
+[Goutte & Gaussier (2005)](https://link.springer.com/chapter/10.1007/978-3-540-31865-1_25).
 
 ```
 precision = TP / (TP + FP)  →  Beta(α + TP,  β + FP)   [exact, closed-form]
@@ -35,12 +38,18 @@ The Bayesian model makes that difference explicit and quantifiable.
 ## Installation
 
 ```bash
+pip install bayesian-precision-recall
+```
+
+Or from source:
+
+```bash
 git clone https://github.com/your-org/bayesian-precision-recall.git
 cd bayesian-precision-recall
 pip install -e .
 ```
 
-**Requirements:** Python ≥ 3.9, numpy, scipy, matplotlib (see [requirements.txt](requirements.txt))
+**Requirements:** Python ≥ 3.9, numpy, scipy, matplotlib
 
 ---
 
@@ -49,18 +58,34 @@ pip install -e .
 ```python
 from bayesian_pr import BayesianPRModel
 
-model = BayesianPRModel(name="classifier_v2")
+model = BayesianPRModel(model_name="classifier_v2", sample_dist_name="test_set")
 model.update(tp=80, fp=26, fn=20)
 print(model.summary())
 ```
 
 ```
-BayesianPRModel: classifier_v2
+BayesianPRModel: classifier_v2 [test_set]
   Prior       : Beta(1.0, 1.0)
   Observations: TP=80, FP=26, FN=20
   Precision   : mean=0.7500, std=0.0415, 95% CI=[0.6646, 0.8267]
   Recall      : mean=0.7941, std=0.0398, 95% CI=[0.7109, 0.8664]
   F1 (MC)     : mean=0.7703, std=0.0291, 95% CI=[0.7106, 0.8248]
+```
+
+`fp` and `fn` are independently optional — only the metrics whose counts have been provided are available:
+
+```python
+# Precision only
+model = BayesianPRModel(model_name="cls")
+model.update(tp=80, fp=26)
+model.precision_stats()   # ✓
+model.recall_stats()      # raises ValueError: no fn observations provided
+
+# Recall only
+model = BayesianPRModel(model_name="cls")
+model.update(tp=80, fn=20)
+model.recall_stats()      # ✓
+model.precision_stats()   # raises ValueError: no fp observations provided
 ```
 
 ---
@@ -71,25 +96,29 @@ BayesianPRModel: classifier_v2
 
 ```python
 BayesianPRModel(
-    prior_alpha: float = 1.0,    # Beta prior α  (uniform by default)
-    prior_beta:  float = 1.0,    # Beta prior β
-    n_samples:   int   = 100_000,
-    name:        str   = "model",
+    model_name:       str   = "model",
+    sample_dist_name: str   = None,      # optional — used for warnings in compare/transfer
+    prior_alpha:      float = 1.0,       # Beta prior α  (uniform by default)
+    prior_beta:       float = 1.0,       # Beta prior β
+    n_samples:        int   = 100_000,
 )
 ```
 
-| Method | Returns | Description |
-|---|---|---|
-| `.update(tp, fp, fn)` | `self` | Incorporate new observations (chainable, callable multiple times) |
-| `.reset()` | `self` | Clear observations, keep prior |
-| `.prob_above_threshold(t, metric)` | `float` | P(true metric > t) |
-| `.precision_stats(ci=0.95)` | `PosteriorStats` | Mean, std, credible interval |
-| `.recall_stats(ci=0.95)` | `PosteriorStats` | Same for recall |
-| `.f1_stats(ci=0.95)` | `PosteriorStats` | Monte Carlo F1 posterior |
-| `.precision_posterior` | `scipy.stats.beta` | Full posterior distribution object |
-| `.recall_posterior` | `scipy.stats.beta` | Full posterior distribution object |
-| `.f1_samples()` | `np.ndarray` | Raw MC samples for custom analysis |
-| `.summary(ci=0.95)` | `str` | Human-readable summary |
+| Method / Property | Returns | Requires | Description |
+|---|---|---|---|
+| `.update(tp, fp=None, fn=None)` | `self` | `fp` or `fn` | Accumulate observations (chainable) |
+| `.reset()` | `self` | — | Clear observations, keep prior |
+| `.has_precision` | `bool` | — | True if fp has been provided |
+| `.has_recall` | `bool` | — | True if fn has been provided |
+| `.has_f1` | `bool` | — | True if both fp and fn have been provided |
+| `.precision_posterior` | `scipy.stats.beta` | fp | Beta posterior for precision |
+| `.recall_posterior` | `scipy.stats.beta` | fn | Beta posterior for recall |
+| `.precision_stats(ci=0.95)` | `PosteriorStats` | fp | Mean, std, credible interval |
+| `.recall_stats(ci=0.95)` | `PosteriorStats` | fn | Same for recall |
+| `.f1_stats(ci=0.95)` | `PosteriorStats` | fp + fn | Monte Carlo F1 posterior |
+| `.f1_samples()` | `np.ndarray` | fp + fn | Raw MC samples for custom analysis |
+| `.prob_above_threshold(t, metric)` | `float` | fp / fn / both | P(true metric > t) |
+| `.summary(ci=0.95)` | `str` | — | Prints only available metrics |
 
 ### `prob_above_threshold`
 
@@ -117,77 +146,60 @@ Confidence comes from volume, not from the rate itself.
 
 ### `compare_models`
 
-```python
-from bayesian_pr import compare_models
+Intended for comparing two **different models** on the **same data distribution**. Emits a warning if `model_name` fields match or `sample_dist_name` fields differ.
 
-result = compare_models(candidate, baseline, metric="precision")
+```python
+from bayesian_pr import compare_models, Metric
+
+result = compare_models(model_a, model_b, metric=Metric.PRECISION)
 # {
-#   "prob_candidate_better": 0.859,
-#   "verdict": "certain_gain",
-#   "mean_diff": +0.042,
-#   "ci_low": 0.008, "ci_high": 0.076,
+#   "prob_a_better": 0.859,
+#   "mean_diff":     +0.042,
+#   "ci_low":        0.008,
+#   "ci_high":       0.076,
+#   "model_a":       "classifier_v2 [test_set]",
+#   "model_b":       "classifier_v1 [test_set]",
+#   "metric":        "precision",
 # }
 ```
-
-| Verdict | Condition |
-|---|---|
-| `certain_gain` | P > 0.80 |
-| `stagnation` | 0.20 ≤ P ≤ 0.80 |
-| `certain_drop` | P < 0.20 |
 
 ### `transfer_test`
 
-Checks whether a model's performance holds up on production data.
+Tests whether the **same model** produces consistent posteriors across **two different data distributions**. Conceptually a one-sample location test framed in terms of the Bayesian posteriors: the posterior mean from the reference distribution (μ_ref) is treated as a fixed point and its tail probability under the evaluation distribution's posterior is measured.
 
 ```python
-from bayesian_pr import transfer_test
+from bayesian_pr import transfer_test, Metric
 
-result = transfer_test(test_model, prod_model, metric="precision")
+result = transfer_test(model_ref, model_eval, metric=Metric.PRECISION)
 # {
-#   "p_hat_test":       0.794,
-#   "prod_mean":        0.381,
-#   "apparent_drop":    +0.413,
-#   "S":                0.0000,
-#   "significant_drop": True,
-#   "verdict":          "domain_shift_detected",
+#   "mu_ref":       0.794,
+#   "mu_eval":      0.381,
+#   "delta":        +0.413,
+#   "S":            0.0000,
+#   "inconsistent": True,
+#   "model_ref":    "cls [dist_A]",
+#   "model_eval":   "cls [dist_B]",
+#   "metric":       "precision",
 # }
 ```
 
-`S = min(F_prod(p̂_test), 1 − F_prod(p̂_test))` measures where the test-set posterior mean
-lands in the production posterior. `S ≤ 0.05` indicates the drop is statistically real.
-A high `S` means the two agree, or the production sample is too small to conclude.
+`S = min(F_eval(μ_ref), 1 − F_eval(μ_ref))`. Small S (≤ 0.05) indicates the two posteriors are statistically inconsistent. F1 is not supported as it has no closed-form CDF.
 
 ---
 
-## Shipping decision example
+## Prior sensitivity
 
-```python
-from bayesian_pr import BayesianPRModel, compare_models, transfer_test
+The Beta prior encodes beliefs before seeing any data. The two hyperparameters
+(α, β) represent pseudo-counts of successes and failures respectively. With little
+data the choice of prior matters; with large samples the posterior is dominated by
+observations regardless of the prior.
 
-PRECISION_FLOOR = 0.65
-RECALL_FLOOR    = 0.35
+![Prior sensitivity](docs/assets/prior_sensitivity.png)
 
-candidate = BayesianPRModel(name="model_v2")
-candidate.update(tp=80, fp=20, fn=25)
-
-baseline  = BayesianPRModel(name="model_v1")
-baseline.update(tp=72, fp=26, fn=28)
-
-prod      = BayesianPRModel(name="model_v2 (prod sample)")
-prod.update(tp=35, fp=10, fn=12)
-
-# Does it clear the acceptance bar?
-p_prob = candidate.prob_above_threshold(PRECISION_FLOOR, "precision")  # 0.999
-r_prob = candidate.prob_above_threshold(RECALL_FLOOR,    "recall")     # 1.000
-
-# Is it better than baseline?
-g2 = compare_models(candidate, baseline, metric="precision")
-# → {"verdict": "certain_gain", "prob_candidate_better": 0.86}
-
-# Does it hold up on production data?
-g3 = transfer_test(candidate, prod, metric="precision")
-# → {"verdict": "transfer_ok", "S": 0.34}
-```
+Each curve shows how a different prior (α, β) shapes the posterior after the same
+observations (TP=8, FP=4). Weakly informative priors (e.g. `Beta(1,1)` — uniform)
+let the data speak; stronger priors require more data to be overcome. The `plot_prior_sensitivity`
+visualization lets you audit this effect for your own observation counts.
 
 ---
 
@@ -234,6 +246,15 @@ For **precision**, `n = TP + FP` and `successes = TP`.
 For **recall**, `n = TP + FN` and `successes = TP`.  
 Beta is the conjugate prior of the Binomial, so the posterior stays in the Beta family — no MCMC needed.
 
+With an uninformed (uniform) prior `Beta(1, 1)`, the posterior **mode** equals the observed metric:
+
+```
+mode = (α + TP − 1) / (α + TP + β + FP − 2)
+     = TP / (TP + FP)   when α = β = 1
+```
+
+This means the Bayesian estimate recovers the classical point estimate as a special case, while the full posterior additionally quantifies uncertainty around it.
+
 **F1** has no closed-form posterior — estimated via Monte Carlo over joint samples:
 
 ```python
@@ -242,23 +263,14 @@ r_samples  = Beta(α_r, β_r).sample(N)
 f1_samples = 2 * p * r / (p + r)
 ```
 
-**`transfer_test`** treats the test-set posterior mean as a fixed reference and measures its
-tail probability in the production posterior:
+**`transfer_test`** treats the reference-distribution posterior mean (μ_ref) as a fixed point
+and measures its tail probability under the evaluation-distribution posterior:
 
 ```
-S = min( F_prod(p̂_test),  1 − F_prod(p̂_test) )
+S = min( F_eval(μ_ref),  1 − F_eval(μ_ref) )
 ```
 
-`F_prod` is the Beta CDF, evaluated analytically. `S ≤ 0.05` → the test estimate sits in a
-thin tail of the production curve → the performance drop is real.
+`F_eval` is the Beta CDF for the evaluation posterior, evaluated analytically.
+`S ≤ 0.05` → μ_ref sits in a thin tail of the evaluation posterior → the posteriors are
+statistically inconsistent. F1 is not supported as it has no closed-form CDF.
 
-Based on: Goutte & Gaussier, *"A Probabilistic Interpretation of Precision, Recall and F-score"*, ECIR 2005.
-
----
-
-## Running tests
-
-```bash
-pip install -e ".[dev]"
-pytest tests/ -v
-```
