@@ -10,7 +10,7 @@ model.update(tp=80, fp=26, fn=20)
 
 print(model.summary())
 print()
-print(f"P(precision > 0.65) = {model.prob_above_threshold(0.65, Metric.PRECISION):.1%}")
+print(f"P(precision > 0.7) = {model.prob_above_threshold(0.7, Metric.PRECISION):.1%}")
 print(f"P(recall    > 0.35) = {model.prob_above_threshold(0.35, Metric.RECALL):.1%}")
 
 fig = plot_posteriors(model)

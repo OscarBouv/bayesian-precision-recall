@@ -20,7 +20,7 @@ F1                          →  Monte Carlo over the joint posterior
 | Point-estimate thinking | Bayesian posterior |
 |---|---|
 | Precision = 0.75 | Precision ∈ [0.66, 0.83] with 95% confidence |
-| "Is 75% above our 65% floor?" | "P(true precision > 65%) = 98.8%" |
+| "Is 75% above our 70% floor?" | "P(true precision > 70%) = 88%" |
 | "Model A is better than B" | "P(A precision > B precision) = 86%" |
 | Results brittle on small test sets | Uncertainty widens automatically |
 | No principled way to use prior knowledge | Beta prior encodes domain expertise |
@@ -124,22 +124,22 @@ BayesianPRModel(
 
 ```python
 # Does this classifier confidently clear the precision floor?
-model.prob_above_threshold(threshold=0.65, metric="precision")
-# → 0.988   # large sample, point estimate well above floor
+model.prob_above_threshold(threshold=0.7, metric="precision")
+# → 0.883   # large sample, point estimate well above floor
 
 # Same question, only 11 predictions behind it:
-sparse_model.prob_above_threshold(threshold=0.65, metric="precision")
-# → 0.085   # too uncertain — acquire more labels
+sparse_model.prob_above_threshold(threshold=0.7, metric="precision")
+# → 0.039   # too uncertain — acquire more labels
 ```
 
-The same 70% point estimate on different sample sizes:
+The same 75% point estimate on different sample sizes:
 
-| n predictions | P(precision > 65%) |
+| n predictions | P(precision > 70%) |
 |---|---|
-| 10  | 57% |
-| 50  | 75% |
-| 100 | 84% |
-| 200 | 93% |
+| 10  | 69% |
+| 50  | 80% |
+| 100 | 85% |
+| 200 | 94% |
 | 500 | 99% |
 
 Confidence comes from volume, not from the rate itself.
@@ -165,25 +165,34 @@ result = compare_models(model_a, model_b, metric=Metric.PRECISION)
 
 ### `transfer_test`
 
-Tests whether the **same model** produces consistent posteriors across **two different data distributions**. Conceptually a one-sample location test framed in terms of the Bayesian posteriors: the posterior mean from the reference distribution (μ_ref) is treated as a fixed point and its tail probability under the evaluation distribution's posterior is measured.
+Tests whether the **same model**'s metric is *practically equivalent* across **two different data distributions** (e.g. test set vs. production), using a **Region of Practical Equivalence (ROPE)** decision on the posterior difference `Δ = p_ref − p_eval`. The 95% highest-density interval (HDI) of Δ is compared against `ROPE = [−eps, +eps]` (default `eps = 0.03`):
+
+- `"equivalent"` — HDI entirely inside the ROPE (no meaningful shift).
+- `"shifted"` — HDI entirely outside the ROPE (meaningful shift; `direction` says which side).
+- `"undecided"` — HDI straddles a ROPE boundary (not enough data).
 
 ```python
 from bayesian_pr import transfer_test, Metric
 
-result = transfer_test(model_ref, model_eval, metric=Metric.PRECISION)
+result = transfer_test(model_ref, model_eval, metric=Metric.PRECISION, eps=0.03, seed=0)
 # {
-#   "mu_ref":       0.794,
-#   "mu_eval":      0.381,
-#   "delta":        +0.413,
-#   "S":            0.0000,
-#   "inconsistent": True,
-#   "model_ref":    "cls [dist_A]",
-#   "model_eval":   "cls [dist_B]",
-#   "metric":       "precision",
+#   "metric":     "precision",
+#   "mu_ref":     0.896,
+#   "mu_eval":    0.598,
+#   "mean_delta": +0.298,
+#   "rho":        0.000,          # posterior mass inside the ROPE
+#   "hdi_low":    0.205,
+#   "hdi_high":   0.388,
+#   "status":     "shifted",
+#   "direction":  "prod_worse",
+#   "model_ref":  "cls [test]",
+#   "model_eval": "cls [prod]",
 # }
 ```
 
-`S = min(F_eval(μ_ref), 1 − F_eval(μ_ref))`. Small S (≤ 0.05) indicates the two posteriors are statistically inconsistent. F1 is not supported as it has no closed-form CDF.
+For raw counts (no model objects), use `transfer_test_rope(tp_test, fp_test, tp_prod, fp_prod, ...)`, or the metric-named wrappers `transfer_test_precision(...)` / `transfer_test_recall(...)` (pass `(TP, FN)` for recall). Unlike the model wrapper, these return a `TransferResult` dataclass.
+
+The decision is symmetric in the two datasets (swapping them flips `direction`, not `status`) and uses the full uncertainty of both. Because the posterior of Δ is drawn by Monte Carlo, F1 is supported too via the model wrapper.
 
 ---
 
@@ -263,14 +272,17 @@ r_samples  = Beta(α_r, β_r).sample(N)
 f1_samples = 2 * p * r / (p + r)
 ```
 
-**`transfer_test`** treats the reference-distribution posterior mean (μ_ref) as a fixed point
-and measures its tail probability under the evaluation-distribution posterior:
+**`transfer_test`** works on the posterior of the difference `Δ = p_ref − p_eval`, drawn by
+Monte Carlo from both Beta posteriors:
 
 ```
-S = min( F_eval(μ_ref),  1 − F_eval(μ_ref) )
+draws_ref  ~ Beta(α + TP_ref,  β + FP_ref)
+draws_eval ~ Beta(α + TP_eval, β + FP_eval)
+Δ = draws_ref − draws_eval
 ```
 
-`F_eval` is the Beta CDF for the evaluation posterior, evaluated analytically.
-`S ≤ 0.05` → μ_ref sits in a thin tail of the evaluation posterior → the posteriors are
-statistically inconsistent. F1 is not supported as it has no closed-form CDF.
+A symmetric Region of Practical Equivalence `ROPE = [−eps, +eps]` (default `eps = 0.03`) defines
+"the same for practical purposes." The 95% **highest-density interval** (HDI) of Δ — not the
+equal-tailed quantiles, since Δ is skewed when either sample is small — is compared to the ROPE:
+entirely inside → `equivalent`; entirely outside → `shifted`; straddling → `undecided`.
 

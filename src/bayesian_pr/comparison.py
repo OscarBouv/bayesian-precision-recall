@@ -7,27 +7,33 @@ compare_models
     distribution. Emits a warning if the model_name fields suggest otherwise.
 
 transfer_test
-    Tests whether a model's posterior over a metric is consistent across two
-    data distributions. Conceptually analogous to a two-sample test, but framed
-    in terms of the Bayesian posteriors: the reference distribution's posterior
-    mean is treated as a fixed point and its tail probability under the second
-    distribution's posterior is measured.
+    Tests whether a model's metric measured on two data distributions (e.g. a
+    test set vs. production) is *practically equivalent* or has *meaningfully
+    shifted*. Uses a Region of Practical Equivalence (ROPE) decision on the
+    posterior of the difference
 
-        S = min(F_2(μ_1), 1 − F_2(μ_1))
+        delta = p_ref - p_eval
 
-    where μ_1 is the posterior mean from distribution 1 and F_2 is the CDF of
-    the posterior fitted on distribution 2. Small S indicates the two posteriors
-    are inconsistent (μ_1 sits in the tail of the second distribution).
+    drawn by Monte Carlo from both Beta posteriors. A symmetric ROPE = [-eps, +eps]
+    around zero defines "the same for practical purposes"; the decision compares
+    the 95% highest-density interval (HDI) of delta against the ROPE:
 
-    Intended for the *same* model evaluated on two *different* distributions.
-    Emits a warning if the model_name fields suggest otherwise.
+      - "equivalent" — HDI lies entirely inside the ROPE (no meaningful shift).
+      - "shifted"    — HDI lies entirely outside the ROPE (meaningful shift).
+      - "undecided"  — HDI straddles a ROPE boundary (not enough data).
+
+    Symmetric in the two datasets and uses the full uncertainty of both. The
+    raw-count form is ``transfer_test_rope``; ``transfer_test`` is the
+    BayesianPRModel-based wrapper. Emits a warning if the model_name /
+    sample_dist_name fields suggest the inputs are mismatched.
 """
 
 from __future__ import annotations
 
 import warnings
 import numpy as np
-from typing import TYPE_CHECKING
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     from .model import BayesianPRModel
@@ -126,64 +132,133 @@ def compare_models(
     }
 
 
+@dataclass
+class TransferResult:
+    """Outcome of a ROPE-based transfer test on the posterior difference delta."""
+    rho: float                  # posterior mass inside the ROPE, P(|delta| <= eps)
+    hdi_low: float
+    hdi_high: float
+    status: str                 # "equivalent" | "shifted" | "undecided"
+    direction: Optional[str]    # "prod_worse" | "prod_better" | None
+    eps: float
+    hdi_mass: float
+
+
+def _hdi(samples: np.ndarray, mass: float) -> tuple[float, float]:
+    """Highest-density interval containing `mass` fraction of `samples`.
+
+    Uses the narrowest-window method (NOT equal-tailed quantiles): the posterior
+    of a difference of Betas is skewed when either sample is small, and the HDI
+    is the correct credible interval in that case.
+    """
+    s = np.sort(samples)
+    n = s.size
+    w = int(np.floor(mass * n))
+    if w < 1:
+        return float(s[0]), float(s[-1])
+    widths = s[w:] - s[:n - w]
+    i = int(np.argmin(widths))
+    return float(s[i]), float(s[i + w])
+
+
+def _rope_decision(delta: np.ndarray, eps: float, hdi_mass: float):
+    """ROPE/HDI decision on a sample of the difference `delta`."""
+    rho = float(np.mean((delta >= -eps) & (delta <= eps)))
+    lo, hi = _hdi(delta, hdi_mass)
+    if lo >= -eps and hi <= eps:
+        status, direction = "equivalent", None
+    elif lo > eps:
+        status, direction = "shifted", "prod_worse"     # ref (test) clearly higher
+    elif hi < -eps:
+        status, direction = "shifted", "prod_better"     # eval (prod) clearly higher
+    else:
+        status, direction = "undecided", None
+    return rho, lo, hi, status, direction
+
+
+def transfer_test_rope(
+    tp_test: int, fp_test: int,
+    tp_prod: int, fp_prod: int,
+    eps: float = 0.03,
+    lam: float = 1.0,
+    hdi_mass: float = 0.95,
+    n_samples: int = 100_000,
+    seed: Optional[int] = None,
+) -> TransferResult:
+    """
+    ROPE-based test of whether a precision (or recall) metric is practically
+    equivalent between a test set and production, from raw counts.
+
+    Posteriors (Beta-Binomial conjugacy with smoothing `lam`):
+
+        p_test ~ Beta(tp_test + lam, fp_test + lam)
+        p_prod ~ Beta(tp_prod + lam, fp_prod + lam)
+        delta  = p_test - p_prod
+
+    The 95% (``hdi_mass``) HDI of `delta` is compared against ROPE = [-eps, +eps]:
+    entirely inside → "equivalent"; entirely outside → "shifted"; straddling a
+    boundary → "undecided".
+
+    Pass (TP, FN) in place of (TP, FP) to run the test on recall.
+    """
+    rng = np.random.default_rng(seed)
+    draws_test = rng.beta(tp_test + lam, fp_test + lam, size=n_samples)
+    draws_prod = rng.beta(tp_prod + lam, fp_prod + lam, size=n_samples)
+    delta = draws_test - draws_prod
+    rho, lo, hi, status, direction = _rope_decision(delta, eps, hdi_mass)
+    return TransferResult(rho, lo, hi, status, direction, eps, hdi_mass)
+
+
+def transfer_test_precision(tp_test, fp_test, tp_prod, fp_prod, **kwargs) -> TransferResult:
+    """ROPE transfer test on precision (TP / (TP+FP))."""
+    return transfer_test_rope(tp_test, fp_test, tp_prod, fp_prod, **kwargs)
+
+
+def transfer_test_recall(tp_test, fn_test, tp_prod, fn_prod, **kwargs) -> TransferResult:
+    """ROPE transfer test on recall (TP / (TP+FN))."""
+    return transfer_test_rope(tp_test, fn_test, tp_prod, fn_prod, **kwargs)
+
+
 def transfer_test(
     model_ref: "BayesianPRModel",
     model_eval: "BayesianPRModel",
     metric: Metric | str = Metric.PRECISION,
-    significance: float = 0.05,
+    eps: float = 0.03,
+    hdi_mass: float = 0.95,
+    n_samples: int = 100_000,
+    seed: Optional[int] = None,
 ) -> dict:
     """
-    Test whether a model's posterior is consistent across two data distributions.
+    ROPE-based transfer test between two BayesianPRModels of the *same* model on
+    two *different* data distributions (e.g. ``model_ref`` = test set,
+    ``model_eval`` = production).
 
-    Treats the posterior mean of model_ref (μ_ref) as a fixed reference point
-    and computes its tail probability under model_eval's posterior:
+    Draws from each model's metric posterior (respecting its prior), forms
+    ``delta = metric_ref - metric_eval``, and applies the ROPE/HDI decision.
+    Unlike the raw-count :func:`transfer_test_rope`, this samples the posteriors
+    directly, so F1 (which has no closed-form posterior) is also supported.
 
-        S = min(F_eval(μ_ref), 1 − F_eval(μ_ref))
-
-    where F_eval is the Beta CDF of model_eval's posterior. S is the probability
-    mass in the smaller tail — equivalent to a one-sample location test framed
-    in terms of the Bayesian posteriors.
-
-      - Large S: μ_ref sits in the bulk of model_eval's posterior → the two
-        distributions yield consistent estimates, or model_eval has too few
-        observations to conclude otherwise.
-      - Small S (≤ significance): μ_ref sits in the tail → the posteriors are
-        statistically inconsistent; the model behaves differently on the two
-        distributions.
-
-    This function is intended to test the *same* model across two *different*
-    data distributions. A warning is raised when:
-      - The models have different model_name values (likely a model comparison,
-        not a distribution consistency check).
+    A warning is raised when:
+      - The models have different model_name values (likely a model comparison).
       - Both models share the same sample_dist_name (no distributional contrast).
 
     Parameters
     ----------
-    model_ref  : BayesianPRModel  Reference distribution (typically larger / more trusted).
-    model_eval : BayesianPRModel  Distribution under evaluation.
-    metric     : Metric | str     One of Metric.PRECISION or Metric.RECALL.
-                                  (F1 is not supported as it has no closed-form CDF.)
-    significance : float          Tail-probability threshold below which the
-                                  posteriors are declared inconsistent. Default 0.05.
+    model_ref, model_eval : BayesianPRModel
+    metric    : Metric | str   One of Metric.PRECISION, RECALL, F1.
+    eps       : float          ROPE half-width (default 0.03 = 3 points).
+    hdi_mass  : float          Credible mass of the HDI (default 0.95).
+    n_samples : int            Monte-Carlo draws (default 100_000).
+    seed      : int | None     RNG seed for reproducibility.
 
     Returns
     -------
     dict with keys:
-        mu_ref          : float  Posterior mean of model_ref (reference point).
-        mu_eval         : float  Posterior mean of model_eval.
-        delta           : float  mu_ref − mu_eval (signed; positive = ref is higher).
-        S               : float  Tail probability; in [0, 0.5].
-        inconsistent    : bool   True when S ≤ significance.
-        model_ref       : str    model_ref.name
-        model_eval      : str    model_eval.name
-        metric          : str    metric used
+        metric, mu_ref, mu_eval, mean_delta, rho, hdi_low, hdi_high,
+        eps, hdi_mass, status ("equivalent"|"shifted"|"undecided"),
+        direction ("prod_worse"|"prod_better"|None), model_ref, model_eval
     """
     metric = Metric(metric)
-    if metric == Metric.F1:
-        raise ValueError(
-            "transfer_test requires a closed-form posterior CDF; "
-            "F1 is not supported. Use Metric.PRECISION or Metric.RECALL."
-        )
 
     if model_ref.model_name != model_eval.model_name:
         warnings.warn(
@@ -208,21 +283,37 @@ def transfer_test(
             stacklevel=2,
         )
 
-    ref_dist  = getattr(model_ref,  f"{metric.value}_posterior")
-    eval_dist = getattr(model_eval, f"{metric.value}_posterior")
+    if metric not in (Metric.PRECISION, Metric.RECALL, Metric.F1):
+        raise ValueError(f"metric must be one of {[m.value for m in Metric]}")
 
-    mu_ref  = float(ref_dist.mean())
-    mu_eval = float(eval_dist.mean())
-    cdf_val = float(eval_dist.cdf(mu_ref))
-    S = min(cdf_val, 1.0 - cdf_val)
+    rng = np.random.default_rng(seed)
+
+    def _samples(model: "BayesianPRModel") -> np.ndarray:
+        if metric == Metric.PRECISION:
+            return model.precision_posterior.rvs(n_samples, random_state=rng)
+        if metric == Metric.RECALL:
+            return model.recall_posterior.rvs(n_samples, random_state=rng)
+        p = model.precision_posterior.rvs(n_samples, random_state=rng)
+        r = model.recall_posterior.rvs(n_samples, random_state=rng)
+        denom = p + r
+        return np.where(denom > 0, 2 * p * r / denom, 0.0)
+
+    st, sp = _samples(model_ref), _samples(model_eval)
+    delta = st - sp
+    rho, lo, hi, status, direction = _rope_decision(delta, eps, hdi_mass)
 
     return {
-        "metric":       metric.value,
-        "mu_ref":       mu_ref,
-        "mu_eval":      mu_eval,
-        "delta":        mu_ref - mu_eval,
-        "S":            S,
-        "inconsistent": S <= significance,
-        "model_ref":    model_ref.name,
-        "model_eval":   model_eval.name,
+        "metric":     metric.value,
+        "mu_ref":     float(st.mean()),
+        "mu_eval":    float(sp.mean()),
+        "mean_delta": float(delta.mean()),
+        "rho":        rho,
+        "hdi_low":    lo,
+        "hdi_high":   hi,
+        "eps":        eps,
+        "hdi_mass":   hdi_mass,
+        "status":     status,
+        "direction":  direction,
+        "model_ref":  model_ref.name,
+        "model_eval": model_eval.name,
     }

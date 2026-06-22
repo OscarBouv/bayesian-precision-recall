@@ -3,14 +3,14 @@ Example 2 — P(metric > threshold)
 
 The same point estimate carries very different confidence depending on sample
 size. This example sweeps three classes at different observation counts and
-shows how P(precision > 0.65) changes as a function of n.
+shows how P(precision > 0.7) changes as a function of n.
 """
 
 from bayesian_pr import BayesianPRModel, Metric
 import matplotlib.pyplot as plt
 import numpy as np
 
-THRESHOLD = 0.65
+THRESHOLD = 0.7
 
 models = [
     BayesianPRModel(model_name="class_A").update(tp=80, fp=26, fn=20),
@@ -18,7 +18,7 @@ models = [
     BayesianPRModel(model_name="class_C").update(tp=5,  fp=6,  fn=8),
 ]
 
-print(f"{'Model':<10} {'P est':>6}  {'P(P>0.65)':>10}")
+print(f"{'Model':<10} {'P est':>6}  {'P(P>0.7)':>10}")
 print("-" * 32)
 for m in models:
     p_est = m._tp / (m._tp + m._fp)
@@ -39,16 +39,16 @@ axes[0].legend(fontsize=9)
 axes[0].spines["top"].set_visible(False)
 axes[0].spines["right"].set_visible(False)
 
-# Fixed 70% point estimate, varying n
+# Fixed 75% point estimate, varying n
 ns = [10, 20, 50, 100, 200, 500]
 probs_n = [
-    BayesianPRModel().update(tp=round(n * 0.70), fp=n - round(n * 0.70), fn=0)
+    BayesianPRModel().update(tp=round(n * 0.75), fp=n - round(n * 0.75), fn=0)
     .prob_above_threshold(THRESHOLD, Metric.PRECISION)
     for n in ns
 ]
 axes[1].plot(ns, probs_n, "o-", lw=2, color="#4C72B0")
 axes[1].axhline(0.70, lw=1.2, ls="--", color="gray", label="0.70")
-axes[1].set_xlabel("n predictions (fixed 70% point estimate)")
+axes[1].set_xlabel("n predictions (fixed 75% point estimate)")
 axes[1].set_ylabel(f"P(true precision > {THRESHOLD})")
 axes[1].set_title("Confidence grows with sample size")
 axes[1].legend(fontsize=9)

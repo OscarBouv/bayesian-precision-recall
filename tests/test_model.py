@@ -1,7 +1,10 @@
 import pytest
 import warnings
 import numpy as np
-from bayesian_pr import BayesianPRModel, Metric, compare_models, transfer_test
+from bayesian_pr import (
+    BayesianPRModel, Metric, compare_models, transfer_test,
+    transfer_test_rope, transfer_test_recall,
+)
 
 
 # ── update() and availability ─────────────────────────────────────────────────
@@ -66,7 +69,7 @@ def test_precision_unavailable_without_fp():
     with pytest.raises(ValueError, match="fp"):
         m.precision_stats()
     with pytest.raises(ValueError, match="fp"):
-        m.prob_above_threshold(0.65, Metric.PRECISION)
+        m.prob_above_threshold(0.7, Metric.PRECISION)
 
 
 def test_recall_unavailable_without_fn():
@@ -186,8 +189,8 @@ def test_invalid_prior():
 def test_prob_above_threshold_accepts_enum_and_string():
     m = BayesianPRModel()
     m.update(tp=80, fp=20, fn=15)
-    assert m.prob_above_threshold(0.65, Metric.PRECISION) == pytest.approx(
-        m.prob_above_threshold(0.65, "precision"), abs=1e-6
+    assert m.prob_above_threshold(0.7, Metric.PRECISION) == pytest.approx(
+        m.prob_above_threshold(0.7, "precision"), abs=1e-6
     )
 
 
@@ -195,25 +198,25 @@ def test_prob_above_threshold_range():
     m = BayesianPRModel()
     m.update(tp=80, fp=20, fn=15)
     for metric in Metric:
-        assert 0 <= m.prob_above_threshold(0.65, metric) <= 1
+        assert 0 <= m.prob_above_threshold(0.7, metric) <= 1
 
 
 def test_prob_above_threshold_high():
     m = BayesianPRModel()
     m.update(tp=200, fp=10, fn=20)
-    assert m.prob_above_threshold(0.65, Metric.PRECISION) > 0.999
+    assert m.prob_above_threshold(0.7, Metric.PRECISION) > 0.999
 
 
 def test_prob_above_threshold_low():
     m = BayesianPRModel()
     m.update(tp=10, fp=40, fn=5)
-    assert m.prob_above_threshold(0.65, Metric.PRECISION) < 0.001
+    assert m.prob_above_threshold(0.7, Metric.PRECISION) < 0.001
 
 
 def test_prob_above_threshold_monotone():
     m = BayesianPRModel()
     m.update(tp=60, fp=20, fn=20)
-    probs = [m.prob_above_threshold(t, Metric.PRECISION) for t in [0.3, 0.5, 0.65, 0.80, 0.90]]
+    probs = [m.prob_above_threshold(t, Metric.PRECISION) for t in [0.3, 0.5, 0.7, 0.80, 0.90]]
     assert all(probs[i] >= probs[i + 1] for i in range(len(probs) - 1))
 
 
@@ -228,7 +231,7 @@ def test_prob_above_threshold_invalid_metric():
     m = BayesianPRModel()
     m.update(tp=50, fp=10, fn=10)
     with pytest.raises(ValueError):
-        m.prob_above_threshold(0.65, "accuracy")
+        m.prob_above_threshold(0.7, "accuracy")
 
 
 # ── compare_models ─────────────────────────────────────────────────────────────
@@ -289,35 +292,87 @@ def test_compare_models_invalid_metric():
         compare_models(a, b, metric="accuracy")
 
 
-# ── transfer_test ─────────────────────────────────────────────────────────────
+# ── transfer_test_rope (raw counts, spec test cases) ────────────────────────────
+
+def test_rope_clear_shift():
+    # test ~0.90, prod ~0.60, both well-sampled
+    r = transfer_test_rope(tp_test=180, fp_test=20, tp_prod=60, fp_prod=40, seed=0)
+    assert r.status == "shifted"
+    assert r.direction == "prod_worse"
+    assert r.rho < 0.01
+
+
+def test_rope_practically_equivalent():
+    # matched, well-sampled distributions -> HDI entirely inside ROPE
+    r = transfer_test_rope(tp_test=900, fp_test=100, tp_prod=900, fp_prod=100, seed=0)
+    assert r.status == "equivalent"
+    assert r.rho > 0.9
+
+
+def test_rope_too_little_data_undecided():
+    # prod estimate 0.60 but only 5 samples -> HDI straddles ROPE
+    r = transfer_test_rope(tp_test=180, fp_test=20, tp_prod=3, fp_prod=2, seed=0)
+    assert r.status == "undecided"
+
+
+def test_rope_determinism():
+    a = transfer_test_rope(180, 20, 60, 40, seed=42)
+    b = transfer_test_rope(180, 20, 60, 40, seed=42)
+    assert (a.rho, a.hdi_low, a.hdi_high) == (b.rho, b.hdi_low, b.hdi_high)
+
+
+def test_rope_symmetry_flips_direction():
+    a = transfer_test_rope(180, 20, 60, 40, seed=7)
+    b = transfer_test_rope(60, 40, 180, 20, seed=7)
+    assert a.status == b.status == "shifted"
+    assert {a.direction, b.direction} == {"prod_worse", "prod_better"}
+
+
+def test_rope_recall_wrapper():
+    # recall wrapper takes (TP, FN); same machinery
+    r = transfer_test_recall(tp_test=180, fn_test=20, tp_prod=60, fn_prod=40, seed=0)
+    assert r.status == "shifted"
+
+
+# ── transfer_test (model-based ROPE wrapper) ────────────────────────────────────
 
 def test_transfer_test_structure():
     ref = BayesianPRModel(model_name="m", sample_dist_name="dist_A")
     ref.update(tp=80, fp=20, fn=20)
     evl = BayesianPRModel(model_name="m", sample_dist_name="dist_B")
     evl.update(tp=40, fp=10, fn=10)
-    result = transfer_test(ref, evl, metric=Metric.PRECISION)
-    assert set(result.keys()) >= {"mu_ref", "mu_eval", "delta", "S", "inconsistent"}
-    assert "verdict" not in result
-    assert 0 <= result["S"] <= 0.5
+    result = transfer_test(ref, evl, metric=Metric.PRECISION, seed=0)
+    assert set(result.keys()) >= {"rho", "hdi_low", "hdi_high", "status", "direction", "mean_delta"}
+    assert result["status"] in {"equivalent", "shifted", "undecided"}
+    assert result["hdi_low"] <= result["hdi_high"]
 
 
-def test_transfer_test_consistent():
+def test_transfer_test_equivalent_status():
     ref = BayesianPRModel(model_name="m", sample_dist_name="A")
-    ref.update(tp=80, fp=20, fn=20)
+    ref.update(tp=900, fp=100)
     evl = BayesianPRModel(model_name="m", sample_dist_name="B")
-    evl.update(tp=40, fp=10, fn=10)
-    assert not transfer_test(ref, evl, metric=Metric.PRECISION)["inconsistent"]
+    evl.update(tp=900, fp=100)
+    assert transfer_test(ref, evl, metric=Metric.PRECISION, seed=0)["status"] == "equivalent"
 
 
-def test_transfer_test_inconsistent():
+def test_transfer_test_shifted_status():
     ref = BayesianPRModel(model_name="m", sample_dist_name="A")
-    ref.update(tp=200, fp=20, fn=30)
+    ref.update(tp=180, fp=20)
     evl = BayesianPRModel(model_name="m", sample_dist_name="B")
-    evl.update(tp=20, fp=60, fn=15)
-    result = transfer_test(ref, evl, metric=Metric.PRECISION)
-    assert result["inconsistent"]
-    assert result["S"] <= 0.05
+    evl.update(tp=60, fp=40)
+    result = transfer_test(ref, evl, metric=Metric.PRECISION, seed=0)
+    assert result["status"] == "shifted"
+    assert result["direction"] == "prod_worse"
+
+
+def test_transfer_test_f1_supported():
+    # ROPE samples the posterior, so F1 is now supported (no closed-form CDF needed)
+    ref = BayesianPRModel(model_name="m", sample_dist_name="A")
+    ref.update(tp=180, fp=20, fn=20)
+    evl = BayesianPRModel(model_name="m", sample_dist_name="B")
+    evl.update(tp=60, fp=40, fn=40)
+    result = transfer_test(ref, evl, metric=Metric.F1, seed=0)
+    assert result["status"] in {"equivalent", "shifted", "undecided"}
 
 
 def test_transfer_test_warns_different_model_name():
@@ -336,12 +391,3 @@ def test_transfer_test_warns_same_distribution():
     b.update(tp=40, fp=10, fn=10)
     with pytest.warns(UserWarning, match="share sample_dist_name"):
         transfer_test(a, b)
-
-
-def test_transfer_test_rejects_f1():
-    a = BayesianPRModel(model_name="m", sample_dist_name="A")
-    a.update(tp=80, fp=20, fn=20)
-    b = BayesianPRModel(model_name="m", sample_dist_name="B")
-    b.update(tp=40, fp=10, fn=10)
-    with pytest.raises(ValueError, match="F1"):
-        transfer_test(a, b, metric=Metric.F1)
